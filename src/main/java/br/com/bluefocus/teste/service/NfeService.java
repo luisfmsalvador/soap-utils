@@ -1,129 +1,177 @@
 package br.com.bluefocus.teste.service;
 
 import br.com.bluefocus.teste.dto.SoapRequest;
-import br.com.bluefocus.teste.dto.SoapResponse;
-import org.apache.http.HttpHeaders;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.conn.ssl.NoopHostnameVerifier;
-import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
-import org.apache.http.conn.ssl.TrustSelfSignedStrategy;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
-import org.apache.http.ssl.SSLContextBuilder;
 import org.apache.http.ssl.SSLContexts;
 import org.apache.http.util.EntityUtils;
-import org.springframework.http.ResponseEntity;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.web.bind.annotation.ExceptionHandler;
 
 import javax.net.ssl.SSLContext;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.Base64;
+import java.util.stream.Stream;
 
 @Service
 public class NfeService {
 
-    public SoapResponse enviarNfe(SoapRequest request) throws Exception {
-        // Ativar logs SSL (apenas para debug)
-        System.setProperty("javax.net.debug", "ssl:handshake:verbose");
+    private static final Logger logger = LoggerFactory.getLogger(NfeService.class);
 
+    public String enviarNfe(SoapRequest request) throws Exception {
         SSLContext sslContext = configureSslContext(request);
 
         try (CloseableHttpClient httpClient = HttpClients.custom()
                 .setSSLContext(sslContext)
-                .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE) // Apenas para testes
+                .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
                 .build()) {
 
             HttpPost httpPost = new HttpPost(request.getEndpointUrl());
+            if (request.getHeaders() != null) {
+                request.getHeaders().forEach(httpPost::addHeader);
+            } else {
+                logger.warn("Cabeçalhos (headers) da requisição SOAP estão nulos.");
+                // Você pode querer lançar uma exceção aqui ou definir cabeçalhos padrão se aplicável
+            }
 
-            // Adicionar headers
-            request.getHeaders().forEach(httpPost::addHeader);
-
-            // Configurar corpo
+            if (request.getSignedXml() == null || request.getSignedXml().isEmpty()) {
+                logger.error("O XML assinado (signedXml) está vazio ou nulo.");
+                throw new IllegalArgumentException("O XML assinado (signedXml) não pode ser vazio.");
+            }
             httpPost.setEntity(new StringEntity(request.getSignedXml(), StandardCharsets.UTF_8));
 
-            // Executar com logs detalhados
-            System.out.println("=== INÍCIO DA REQUISIÇÃO ===");
-            try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
-                String responseBody = EntityUtils.toString(response.getEntity());
-                System.out.println("=== RESPOSTA RECEBIDA ===");
-                System.out.println("Status: " + response.getStatusLine());
-                System.out.println("Body: " + responseBody.substring(0, Math.min(responseBody.length(), 1000)));
+            logger.info("Enviando requisição NFe para endpoint: {}", request.getEndpointUrl());
 
-                SoapResponse soapResponse = new SoapResponse();
-                soapResponse.setStatusCode(response.getStatusLine().getStatusCode());
-                soapResponse.setResponseBody(responseBody);
-                return soapResponse;
+            try (CloseableHttpResponse response = httpClient.execute(httpPost)) {
+                String responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                int httpStatusCode = response.getStatusLine().getStatusCode();
+
+                logger.info("Resposta recebida da SEFAZ. Status HTTP: {}", httpStatusCode);
+                if (logger.isDebugEnabled() && responseBody != null) {
+                    logger.debug("Corpo da resposta SEFAZ (truncado): {}", responseBody.substring(0, Math.min(responseBody.length(), 1000)));
+                } else if (responseBody == null) {
+                    logger.warn("Corpo da resposta da SEFAZ está nulo.");
+                }
+
+
+                if (httpStatusCode >= 200 && httpStatusCode < 300) {
+                    return responseBody;
+                } else {
+                    String errorDetails = responseBody != null ? responseBody.substring(0, Math.min(responseBody.length(), 500)) : "Sem corpo de resposta";
+                    logger.error("Erro HTTP ao comunicar com a SEFAZ: {} - Resposta: {}", httpStatusCode, errorDetails);
+                    throw new IOException("Falha na comunicação HTTP com a SEFAZ. Status: " + httpStatusCode + ". Resposta: " + errorDetails);
+                }
             }
+        } catch (Exception e) {
+            logger.error("Erro ao enviar NFe: {}", e.getMessage(), e);
+            throw e;
         }
     }
 
     private SSLContext configureSslContext(SoapRequest request) throws Exception {
+        char[] passwordChars = null;
         try {
-            // 1. Configurar certificado cliente
+            if (request.getPassword() == null) {
+                logger.error("Senha do certificado digital não fornecida.");
+                throw new IllegalArgumentException("Senha do certificado digital não fornecida.");
+            }
+            passwordChars = request.getPassword().toCharArray();
+
+            if (request.getDigitalCertificate() == null) {
+                logger.error("Certificado digital (digitalCertificate) não fornecido na requisição.");
+                throw new IllegalArgumentException("Certificado digital não fornecido.");
+            }
             byte[] certBytes = Base64.getDecoder().decode(request.getDigitalCertificate());
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
-            keyStore.load(new ByteArrayInputStream(certBytes), request.getPassword().toCharArray());
+            try (InputStream keyStoreStream = new ByteArrayInputStream(certBytes)) {
+                keyStore.load(keyStoreStream, passwordChars);
+            }
 
-            // 2. Configurar truststore (certificados da SEFAZ)
-            KeyStore trustStore = loadTrustStore(request);
+            KeyStore trustStore;
+            if (request.getTrustCertificatesPath() != null && !request.getTrustCertificatesPath().trim().isEmpty()) {
+                trustStore = loadTrustStoreFromDirectory(request.getTrustCertificatesPath());
+            } else {
+                logger.info("Nenhum trustCertificatesPath fornecido, usando cacerts padrão do Java.");
+                trustStore = loadDefaultJavaTrustStore();
+            }
 
-            // 3. Configurar SSLContext com propriedades específicas
-            SSLContext sslContext = SSLContexts.custom()
+            return SSLContexts.custom()
                     .setProtocol("TLSv1.2")
-                    .loadKeyMaterial(keyStore, request.getPassword().toCharArray())
+                    .loadKeyMaterial(keyStore, passwordChars)
                     .loadTrustMaterial(trustStore, null)
                     .build();
 
-            // 4. Configurar propriedades adicionais do sistema
-            System.setProperty("https.protocols", "TLSv1.2");
-            System.setProperty("jdk.tls.client.protocols", "TLSv1.2");
-
-            return sslContext;
         } catch (Exception e) {
-            throw new RuntimeException("Falha ao configurar SSL: " + e.getMessage(), e);
+            logger.error("Falha ao configurar o contexto SSL: {}", e.getMessage(), e);
+            throw new Exception("Falha ao configurar o contexto SSL: " + e.getMessage(), e);
+        } finally {
+            if (passwordChars != null) {
+                java.util.Arrays.fill(passwordChars, '\0');
+            }
         }
     }
 
-    private KeyStore loadTrustStore(SoapRequest request) throws Exception {
-        KeyStore trustStore = KeyStore.getInstance("JKS");
+    private KeyStore loadTrustStoreFromDirectory(String trustCertificatesPath) throws Exception {
+        logger.info("Carregando certificados da cadeia do diretório: {}", trustCertificatesPath);
+        KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        trustStore.load(null, null);
 
-        // Se truststore foi fornecido na requisição
-        if (request.getTrustStore() != null && !request.getTrustStore().isEmpty()) {
-            byte[] tsBytes = Base64.getDecoder().decode(request.getTrustStore());
-            trustStore.load(new ByteArrayInputStream(tsBytes), request.getPassword().toCharArray());
+        Path certDirectory = Paths.get(trustCertificatesPath);
+        if (!Files.isDirectory(certDirectory)) {
+            logger.warn("O caminho fornecido para os certificados da cadeia não é um diretório válido: {}. Tentando carregar cacerts padrão.", trustCertificatesPath);
+            return loadDefaultJavaTrustStore();
         }
-        // Usar truststore padrão do Java
-        else {
-            String defaultTrustStore = System.getProperty("java.home") + "/lib/security/cacerts";
-            try (InputStream is = new FileInputStream(defaultTrustStore)) {
-                trustStore.load(is, "changeit".toCharArray());
+
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        int certsLoaded = 0;
+        try (Stream<Path> paths = Files.list(certDirectory)) {
+            for (Path filePath : paths.filter(Files::isRegularFile).toList()) {
+                try (InputStream certInputStream = new BufferedInputStream(new FileInputStream(filePath.toFile()))) {
+                    for (Certificate certificate : cf.generateCertificates(certInputStream)) {
+                        if (certificate instanceof X509Certificate) {
+                            X509Certificate x509Cert = (X509Certificate) certificate;
+                            String alias = filePath.getFileName().toString() + "_" + x509Cert.getSerialNumber().toString(16);
+                            trustStore.setCertificateEntry(alias, x509Cert);
+                            logger.debug("Certificado adicionado ao TrustStore: {} com alias: {} (Subject: {})", filePath.getFileName(), alias, x509Cert.getSubjectX500Principal());
+                            certsLoaded++;
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.warn("Falha ao carregar o certificado do arquivo: {} - {}", filePath, e.getMessage());
+                }
             }
         }
+
+        if (certsLoaded == 0) {
+            logger.warn("Nenhum certificado foi carregado do diretório: {}. Usando cacerts padrão como fallback.", trustCertificatesPath);
+            return loadDefaultJavaTrustStore();
+        }
+        logger.info("{} certificados carregados do diretório para o TrustStore.", certsLoaded);
         return trustStore;
     }
 
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<SoapResponse> handleAllExceptions(Exception ex) {
-        SoapResponse response = new SoapResponse();
-        response.setStatusCode(500);
-
-        String errorMsg = "Erro na requisição: ";
-        if (ex.getCause() != null) {
-            errorMsg += ex.getCause().getMessage();
-        } else {
-            errorMsg += ex.getMessage();
+    private KeyStore loadDefaultJavaTrustStore() throws Exception {
+        String filename = System.getProperty("java.home") + "/lib/security/cacerts".replace('/', File.separatorChar);
+        logger.info("Carregando TrustStore padrão Java de: {}", filename);
+        KeyStore keystore = KeyStore.getInstance(KeyStore.getDefaultType());
+        char[] password = "changeit".toCharArray();
+        try (FileInputStream is = new FileInputStream(filename)) {
+            keystore.load(is, password);
         }
-
-        // Log detalhado para diagnóstico
-        System.err.println("=== ERRO DETALHADO ===");
-        ex.printStackTrace();
-
-        response.setErrorMessage(errorMsg);
-        return ResponseEntity.internalServerError().body(response);
+        logger.info("TrustStore padrão 'cacerts' carregado com {} certificados.", keystore.size());
+        return keystore;
     }
 }

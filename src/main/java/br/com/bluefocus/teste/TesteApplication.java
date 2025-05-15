@@ -10,5 +10,4 @@ public class TesteApplication {
         System.setProperty("javax.net.debug", "all");
         SpringApplication.run(TesteApplication.class, args);
     }
-
 }
